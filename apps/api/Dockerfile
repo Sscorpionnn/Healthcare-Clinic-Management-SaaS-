@@ -2,7 +2,7 @@
 # Multi-stage build for the NestJS API. Build context is the repo root
 # (pnpm workspace) — see docker-compose.yml.
 
-FROM node:20.18.1-alpine3.20 AS base
+FROM node:24.1.0-alpine3.20 AS base
 RUN corepack enable && corepack prepare pnpm@9.15.9 --activate
 WORKDIR /repo
 
@@ -28,7 +28,7 @@ RUN pnpm --filter api run build
 RUN pnpm deploy --filter=api --prod /repo/deploy/api
 
 # ---- runtime: minimal, non-root ----------------------------------------
-FROM node:20.18.1-alpine3.20 AS runtime
+FROM node:24.1.0-alpine3.20 AS runtime
 RUN apk add --no-cache dumb-init \
  && addgroup -S app && adduser -S app -G app
 WORKDIR /app
