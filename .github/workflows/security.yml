@@ -75,7 +75,7 @@ jobs:
       - name: Build ${{ matrix.app }} image
         run: docker build -f apps/${{ matrix.app }}/Dockerfile -t clinic-${{ matrix.app }}:ci .
       - name: Scan with Trivy
-        uses: aquasecurity/trivy-action@0.29.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: clinic-${{ matrix.app }}:ci
           format: sarif
