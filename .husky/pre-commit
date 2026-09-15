@@ -1,0 +1,12 @@
+#!/usr/bin/env sh
+
+# Secret scan on staged changes only (fast). Skips gracefully if gitleaks
+# isn't installed locally — CI's security.yml is the enforced gate; this
+# hook is a fast local backstop, not the source of truth.
+if command -v gitleaks >/dev/null 2>&1; then
+  gitleaks protect --staged --redact --config .gitleaks.toml
+else
+  echo "gitleaks not installed locally — skipping pre-commit secret scan (still enforced in CI)."
+fi
+
+pnpm exec lint-staged

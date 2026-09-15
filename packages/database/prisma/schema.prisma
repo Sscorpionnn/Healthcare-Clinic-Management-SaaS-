@@ -1,0 +1,573 @@
+// Clinic Management SaaS — data model.
+// Every tenant-scoped model carries `clinicId` and is protected by
+// Postgres Row-Level Security policies applied in prisma/rls.sql
+// (see docs/multi-tenancy.md for the two-layer isolation strategy).
+
+generator client {
+  provider = "prisma-client-js"
+  output   = "../generated/client"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum Role {
+  SUPER_ADMIN
+  CLINIC_ADMIN
+  DOCTOR
+  NURSE
+  RECEPTIONIST
+  BILLING_MANAGER
+  PATIENT
+}
+
+enum MembershipStatus {
+  INVITED
+  ACTIVE
+  SUSPENDED
+  REVOKED
+}
+
+enum ClinicStatus {
+  ACTIVE
+  SUSPENDED
+  ARCHIVED
+}
+
+enum AppointmentStatus {
+  REQUESTED
+  CONFIRMED
+  CHECKED_IN
+  COMPLETED
+  CANCELLED
+  NO_SHOW
+}
+
+enum RecordStatus {
+  DRAFT
+  FINALIZED
+  AMENDED
+}
+
+enum DocumentCategory {
+  CLINICAL
+  BILLING
+  INTAKE
+  IDENTITY
+}
+
+enum DocumentStatus {
+  PENDING
+  AVAILABLE
+  REJECTED
+  QUARANTINED
+  DELETED
+}
+
+enum InvoiceStatus {
+  DRAFT
+  ISSUED
+  PAID
+  PARTIALLY_PAID
+  VOID
+  OVERDUE
+}
+
+enum PaymentMethod {
+  CASH
+  CARD_ON_FILE_TOKEN
+  BANK_TRANSFER
+  INSURANCE
+}
+
+enum NotificationChannel {
+  IN_APP
+  EMAIL
+  WEBSOCKET
+}
+
+enum ExportStatus {
+  PENDING
+  PROCESSING
+  READY
+  EXPIRED
+  FAILED
+}
+
+enum DeletionSubjectType {
+  PATIENT
+  CLINIC
+}
+
+enum DeletionStatus {
+  PENDING_REVIEW
+  APPROVED
+  REJECTED
+  SCHEDULED
+  COMPLETED
+}
+
+// ---------------------------------------------------------------------------
+// Identity & tenancy
+// ---------------------------------------------------------------------------
+
+model User {
+  id            String   @id @default(uuid()) @db.Uuid
+  email         String   @unique
+  passwordHash  String
+  isSuperAdmin  Boolean  @default(false)
+  isActive      Boolean  @default(true)
+  mfaSecret     String?
+  mfaEnabled    Boolean  @default(false)
+  lastLoginAt   DateTime?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  memberships         Membership[]
+  refreshTokens       RefreshToken[]
+  auditLogs           AuditLog[]           @relation("AuditActor")
+  notifications       Notification[]
+  passwordResetTokens PasswordResetToken[]
+
+  @@map("users")
+}
+
+model RefreshToken {
+  id           String    @id @default(uuid()) @db.Uuid
+  userId       String    @db.Uuid
+  membershipId String?   @db.Uuid // null for a SUPER_ADMIN platform session
+  tokenHash    String    @unique
+  family       String    @db.Uuid
+  expiresAt    DateTime
+  revokedAt    DateTime?
+  replacedBy   String?   @db.Uuid
+  createdByIp  String?
+  userAgent    String?
+  createdAt    DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([family])
+  @@map("refresh_tokens")
+}
+
+// Not tenant-scoped (excluded from RLS/TENANT_SCOPED_MODELS): both are
+// looked up by opaque token hash before any tenant/session context exists
+// (password-reset request/confirm, invite acceptance are @Public() routes).
+model PasswordResetToken {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @db.Uuid
+  tokenHash String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("password_reset_tokens")
+}
+
+model InviteToken {
+  id           String    @id @default(uuid()) @db.Uuid
+  membershipId String    @unique @db.Uuid
+  tokenHash    String    @unique
+  expiresAt    DateTime
+  usedAt       DateTime?
+  createdAt    DateTime  @default(now())
+
+  membership Membership @relation(fields: [membershipId], references: [id], onDelete: Cascade)
+
+  @@map("invite_tokens")
+}
+
+model Clinic {
+  id        String       @id @default(uuid()) @db.Uuid
+  name      String
+  slug      String       @unique
+  status    ClinicStatus @default(ACTIVE)
+  timezone  String       @default("UTC")
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+
+  departments        Department[]
+  memberships        Membership[]
+  patients           PatientProfile[]
+  appointments       Appointment[]
+  availabilitySlots  AvailabilitySlot[]
+  medicalRecords     MedicalRecord[]
+  documents          Document[]
+  invoices           Invoice[]
+  notifications      Notification[]
+  auditLogs          AuditLog[]
+  exportRequests     DataExportRequest[]
+  deletionRequests   DeletionRequest[]
+
+  @@map("clinics")
+}
+
+model Department {
+  id        String   @id @default(uuid()) @db.Uuid
+  clinicId  String   @db.Uuid
+  name      String
+  description String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  clinic       Clinic        @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+  memberships  Membership[]
+  appointments Appointment[]
+
+  @@index([clinicId])
+  @@map("departments")
+}
+
+// A Membership is a user's role within one clinic. A user with roles in
+// multiple clinics has multiple Membership rows — identities never merge
+// across tenants.
+model Membership {
+  id           String           @id @default(uuid()) @db.Uuid
+  userId       String           @db.Uuid
+  clinicId     String           @db.Uuid
+  departmentId String?          @db.Uuid
+  role         Role
+  status       MembershipStatus @default(INVITED)
+  invitedAt    DateTime         @default(now())
+  joinedAt     DateTime?
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+
+  user       User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  clinic     Clinic      @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+  department Department? @relation(fields: [departmentId], references: [id])
+
+  doctorProfile DoctorProfile?
+  inviteToken   InviteToken?
+
+  @@unique([userId, clinicId])
+  @@index([clinicId, role])
+  @@map("memberships")
+}
+
+model DoctorProfile {
+  id             String  @id @default(uuid()) @db.Uuid
+  clinicId       String  @db.Uuid // denormalized from membership.clinicId so this fits the standard RLS/tenant-scoping pattern like every other tenant table
+  membershipId   String  @unique @db.Uuid
+  specialty      String
+  licenseNumber  String // application-level encrypted
+  bio            String?
+
+  membership        Membership          @relation(fields: [membershipId], references: [id], onDelete: Cascade)
+  appointments       Appointment[]
+  availabilitySlots  AvailabilitySlot[]
+  medicalRecords     MedicalRecord[]
+
+  @@index([clinicId])
+  @@map("doctor_profiles")
+}
+
+// ---------------------------------------------------------------------------
+// Patients
+// ---------------------------------------------------------------------------
+
+model PatientProfile {
+  id               String    @id @default(uuid()) @db.Uuid
+  clinicId         String    @db.Uuid
+  userId           String?   @unique @db.Uuid // null until patient portal access is granted
+  firstName        String // application-level encrypted
+  lastName         String // application-level encrypted
+  dateOfBirth      String // application-level encrypted (ISO date string)
+  phone            String? // application-level encrypted
+  email            String? // application-level encrypted
+  address          String? // application-level encrypted (JSON blob)
+  emergencyContact String? // application-level encrypted (JSON blob)
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+  deletedAt        DateTime? // soft delete for retention workflow
+
+  clinic         Clinic          @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+  appointments   Appointment[]
+  medicalRecords MedicalRecord[]
+  documents      Document[]
+  invoices       Invoice[]
+
+  @@index([clinicId])
+  @@map("patient_profiles")
+}
+
+// ---------------------------------------------------------------------------
+// Scheduling
+// ---------------------------------------------------------------------------
+
+model AvailabilitySlot {
+  id           String   @id @default(uuid()) @db.Uuid
+  clinicId     String   @db.Uuid
+  doctorId     String   @db.Uuid
+  dayOfWeek    Int // 0-6
+  startMinute  Int // minutes from midnight, local clinic timezone
+  endMinute    Int
+  effectiveFrom DateTime
+  effectiveTo   DateTime?
+  createdAt    DateTime @default(now())
+
+  clinic Clinic        @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+  doctor DoctorProfile @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+
+  @@index([clinicId, doctorId])
+  @@map("availability_slots")
+}
+
+model Appointment {
+  id           String            @id @default(uuid()) @db.Uuid
+  clinicId     String            @db.Uuid
+  patientId    String            @db.Uuid
+  doctorId     String            @db.Uuid
+  departmentId String?           @db.Uuid
+  startsAt     DateTime
+  endsAt       DateTime
+  status       AppointmentStatus @default(REQUESTED)
+  reason       String? // short, non-clinical description only
+  cancelReason String?
+  createdByMembershipId String? @db.Uuid
+  createdAt    DateTime          @default(now())
+  updatedAt    DateTime          @updatedAt
+
+  clinic     Clinic          @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+  patient    PatientProfile  @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  doctor     DoctorProfile   @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+  department Department?     @relation(fields: [departmentId], references: [id])
+  medicalRecord MedicalRecord?
+  invoice    Invoice?
+
+  @@index([clinicId, doctorId, startsAt])
+  @@index([clinicId, patientId])
+  @@map("appointments")
+}
+
+// ---------------------------------------------------------------------------
+// Clinical
+// ---------------------------------------------------------------------------
+
+model MedicalRecord {
+  id             String       @id @default(uuid()) @db.Uuid
+  clinicId       String       @db.Uuid
+  patientId      String       @db.Uuid
+  doctorId       String       @db.Uuid
+  appointmentId  String?      @unique @db.Uuid
+  visitDate      DateTime
+  chiefComplaint String? // application-level encrypted
+  diagnosisNotes String? // application-level encrypted
+  status         RecordStatus @default(DRAFT)
+  version        Int          @default(1)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  clinic      Clinic          @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+  patient     PatientProfile  @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  doctor      DoctorProfile   @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+  appointment Appointment?    @relation(fields: [appointmentId], references: [id])
+  treatmentNotes TreatmentNote[]
+  documents      Document[]
+
+  @@index([clinicId, patientId])
+  @@map("medical_records")
+}
+
+model TreatmentNote {
+  id                   String   @id @default(uuid()) @db.Uuid
+  clinicId             String   @db.Uuid
+  medicalRecordId      String   @db.Uuid
+  authorMembershipId   String   @db.Uuid
+  noteType             String
+  content              String // application-level encrypted
+  version              Int      @default(1)
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  medicalRecord MedicalRecord @relation(fields: [medicalRecordId], references: [id], onDelete: Cascade)
+
+  @@index([clinicId, medicalRecordId])
+  @@map("treatment_notes")
+}
+
+// ---------------------------------------------------------------------------
+// Documents
+// ---------------------------------------------------------------------------
+
+model Document {
+  id                   String           @id @default(uuid()) @db.Uuid
+  clinicId             String           @db.Uuid
+  ownerPatientId       String           @db.Uuid
+  medicalRecordId      String?          @db.Uuid
+  uploadedByMembershipId String         @db.Uuid
+  category             DocumentCategory
+  originalFilename     String
+  declaredMimeType     String
+  detectedMimeType     String?
+  sizeBytes            Int
+  storageKey           String           @unique
+  checksumSha256       String?
+  status               DocumentStatus   @default(PENDING)
+  rejectionReason      String?
+  createdAt            DateTime         @default(now())
+  updatedAt            DateTime         @updatedAt
+
+  clinic        Clinic          @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+  ownerPatient  PatientProfile  @relation(fields: [ownerPatientId], references: [id], onDelete: Cascade)
+  medicalRecord MedicalRecord?  @relation(fields: [medicalRecordId], references: [id])
+
+  @@index([clinicId, ownerPatientId])
+  @@map("documents")
+}
+
+// ---------------------------------------------------------------------------
+// Billing
+// ---------------------------------------------------------------------------
+
+model Invoice {
+  id            String        @id @default(uuid()) @db.Uuid
+  clinicId      String        @db.Uuid
+  patientId     String        @db.Uuid
+  appointmentId String?       @unique @db.Uuid
+  status        InvoiceStatus @default(DRAFT)
+  currency      String        @default("USD")
+  totalAmount   Decimal       @db.Decimal(10, 2)
+  issuedAt      DateTime?
+  dueAt         DateTime?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  clinic      Clinic            @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+  patient     PatientProfile    @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  appointment Appointment?      @relation(fields: [appointmentId], references: [id])
+  lineItems   InvoiceLineItem[]
+  payments    Payment[]
+
+  @@index([clinicId, patientId])
+  @@map("invoices")
+}
+
+model InvoiceLineItem {
+  id          String  @id @default(uuid()) @db.Uuid
+  invoiceId   String  @db.Uuid
+  description String
+  quantity    Int     @default(1)
+  unitAmount  Decimal @db.Decimal(10, 2)
+  amount      Decimal @db.Decimal(10, 2)
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@index([invoiceId])
+  @@map("invoice_line_items")
+}
+
+model Payment {
+  id        String        @id @default(uuid()) @db.Uuid
+  invoiceId String        @db.Uuid
+  amount    Decimal       @db.Decimal(10, 2)
+  method    PaymentMethod
+  reference String? // external gateway reference only, never raw card data
+  paidAt    DateTime      @default(now())
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@index([invoiceId])
+  @@map("payments")
+}
+
+// ---------------------------------------------------------------------------
+// Notifications
+// ---------------------------------------------------------------------------
+
+model Notification {
+  id               String              @id @default(uuid()) @db.Uuid
+  clinicId         String              @db.Uuid
+  recipientUserId  String              @db.Uuid
+  channel          NotificationChannel
+  type             String
+  title            String // generic, never clinical content
+  linkResourceType String?
+  linkResourceId   String?             @db.Uuid
+  readAt           DateTime?
+  createdAt        DateTime            @default(now())
+
+  clinic    Clinic @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+  recipient User   @relation(fields: [recipientUserId], references: [id], onDelete: Cascade)
+
+  @@index([clinicId, recipientUserId, readAt])
+  @@map("notifications")
+}
+
+// ---------------------------------------------------------------------------
+// Audit log (append-only; no update/delete grants for the app role — see
+// prisma/rls.sql)
+// ---------------------------------------------------------------------------
+
+model AuditLog {
+  id             String   @id @default(uuid()) @db.Uuid
+  clinicId       String?  @db.Uuid // null for platform-level actions
+  actorUserId    String?  @db.Uuid
+  actorRole      Role?
+  action         String
+  resourceType   String
+  resourceId     String?  @db.Uuid
+  ipHash         String?
+  userAgentHash  String?
+  metadata       Json?    // redacted metadata only, never clinical content
+  createdAt      DateTime @default(now())
+
+  clinic Clinic? @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+  actor  User?   @relation("AuditActor", fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([clinicId, createdAt])
+  @@index([actorUserId])
+  @@map("audit_logs")
+}
+
+// ---------------------------------------------------------------------------
+// Data subject rights
+// ---------------------------------------------------------------------------
+
+model DataExportRequest {
+  id               String       @id @default(uuid()) @db.Uuid
+  clinicId         String       @db.Uuid
+  requestedByUserId String      @db.Uuid
+  subjectPatientId String?      @db.Uuid
+  status           ExportStatus @default(PENDING)
+  downloadKey      String?      @unique
+  expiresAt        DateTime?
+  createdAt        DateTime     @default(now())
+  updatedAt        DateTime     @updatedAt
+
+  clinic Clinic @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+
+  @@index([clinicId])
+  @@map("data_export_requests")
+}
+
+model DeletionRequest {
+  id                  String              @id @default(uuid()) @db.Uuid
+  clinicId            String              @db.Uuid
+  requestedByUserId   String              @db.Uuid
+  subjectType         DeletionSubjectType
+  subjectPatientId    String?             @db.Uuid
+  status              DeletionStatus      @default(PENDING_REVIEW)
+  retentionHoldReason String?
+  reviewedByUserId    String?             @db.Uuid
+  scheduledFor        DateTime?
+  completedAt         DateTime?
+  createdAt           DateTime            @default(now())
+  updatedAt           DateTime            @updatedAt
+
+  clinic Clinic @relation(fields: [clinicId], references: [id], onDelete: Cascade)
+
+  @@index([clinicId])
+  @@map("deletion_requests")
+}

@@ -1,0 +1,52 @@
+title = "clinic-management-saas gitleaks config"
+
+# Start from gitleaks' maintained default ruleset, then layer app-specific
+# rules on top for the secret-shaped env vars this repo defines.
+[extend]
+useDefault = true
+
+[[rules]]
+id = "clinic-jwt-secret"
+description = "JWT signing secret assigned a non-placeholder value"
+regex = '''(?i)(JWT_ACCESS_SECRET|JWT_REFRESH_SECRET|CSRF_SECRET)\s*=\s*["']?(?!replace-with-|change-me-|ci-test-)[A-Za-z0-9+/=_-]{16,}["']?'''
+tags = ["secret", "jwt"]
+
+[[rules]]
+id = "clinic-field-encryption-key"
+description = "Field-level encryption key assigned a non-placeholder value"
+regex = '''(?i)FIELD_ENCRYPTION_KEY\s*=\s*["']?(?!replace-with-)[A-Za-z0-9+/=]{20,}["']?'''
+tags = ["secret", "encryption"]
+
+[[rules]]
+id = "clinic-storage-secret-key"
+description = "Object storage secret key assigned a non-placeholder value"
+regex = '''(?i)STORAGE_SECRET_KEY\s*=\s*["']?(?!change-me-|test-only-)[A-Za-z0-9+/=_-]{12,}["']?'''
+tags = ["secret", "storage"]
+
+[[rules]]
+id = "clinic-db-password"
+description = "Database URL with a non-placeholder password"
+regex = '''postgresql:\/\/[^:]+:(?!change-me-locally|test-only-password)[^@\s]{6,}@'''
+tags = ["secret", "database"]
+
+# Files that intentionally contain placeholder-looking (but not real)
+# secret values, and generated/vendored content that should never be
+# scanned in the first place.
+[allowlist]
+description = "Known-safe placeholder files and generated output"
+paths = [
+  '''\.env\.example$''',
+  '''docker-compose\.test\.yml$''',
+  '''packages/database/generated/.*''',
+  '''pnpm-lock\.yaml$''',
+]
+regexes = [
+  '''change-me-locally''',
+  '''change-me-in-environment-secrets''',
+  '''test-only-password''',
+  '''replace-with-a-[a-z0-9-]+''',
+  '''ci-test-[a-z-]+-not-for-production-use''',
+  # Fixed, published, non-secret 32-byte test key used only by
+  # .github/workflows/ci.yml to run the ephemeral test stack.
+  '''MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=''',
+]

@@ -1,0 +1,126 @@
+# Local development stack. Not used in production — a production deployment
+# provides its own managed Postgres/Redis/object storage and terminates TLS
+# at a reverse proxy in front of the `api`/`web` images built from the
+# Dockerfiles in apps/api and apps/web (see docs/architecture.md).
+#
+# Usage:
+#   cp .env.example .env          # then edit values
+#   docker compose up -d postgres redis minio mailhog
+#   pnpm db:migrate && pnpm --filter @clinic/database run roles:apply && pnpm --filter @clinic/database run rls:apply
+#   pnpm db:seed
+#   pnpm dev                      # runs api + web outside docker for fast local iteration
+#
+# To run the full containerized stack instead (api/web as images too):
+#   docker compose --profile full up -d --build
+
+name: clinic-management-saas
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-clinic_app}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-locally}
+      POSTGRES_DB: ${POSTGRES_DB:-clinic_management}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-clinic_app} -d ${POSTGRES_DB:-clinic_management}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: quay.io/minio/minio:latest
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${STORAGE_ACCESS_KEY:-clinic_storage}
+      MINIO_ROOT_PASSWORD: ${STORAGE_SECRET_KEY:-change-me-locally}
+    ports:
+      - "${STORAGE_PORT:-9000}:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    restart: "no"
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${STORAGE_ACCESS_KEY:-clinic_storage} ${STORAGE_SECRET_KEY:-change-me-locally} &&
+      mc mb --ignore-existing local/${STORAGE_BUCKET_PRIVATE:-clinic-documents} &&
+      mc mb --ignore-existing local/${STORAGE_BUCKET_QUARANTINE:-clinic-documents-quarantine} &&
+      mc anonymous set none local/${STORAGE_BUCKET_PRIVATE:-clinic-documents} &&
+      mc anonymous set none local/${STORAGE_BUCKET_QUARANTINE:-clinic-documents-quarantine} &&
+      echo 'MinIO buckets ready (private by default).'
+      "
+
+  mailhog:
+    image: mailhog/mailhog:latest
+    restart: unless-stopped
+    ports:
+      - "${SMTP_PORT:-1025}:1025" # SMTP
+      - "8025:8025" # web UI
+
+  api:
+    profiles: ["full"]
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-clinic_app}:${POSTGRES_PASSWORD:-change-me-locally}@postgres:5432/${POSTGRES_DB:-clinic_management}?schema=public
+      REDIS_URL: redis://redis:6379
+      STORAGE_ENDPOINT: minio
+    ports:
+      - "${API_PORT:-4000}:4000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+
+  web:
+    profiles: ["full"]
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      API_URL: http://api:4000
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    depends_on:
+      - api
+
+volumes:
+  postgres_data:
+  minio_data:

@@ -1,0 +1,105 @@
+name: Integration & Security Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: integration-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PNPM_VERSION: "9.15.9"
+  NODE_VERSION: "20"
+
+jobs:
+  integration:
+    name: Tenant isolation, IDOR & security suite
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: clinic_app
+          POSTGRES_PASSWORD: ci-only-password
+          POSTGRES_DB: clinic_management_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U clinic_app -d clinic_management_test"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 5s --health-retries 10
+      minio:
+        image: bitnami/minio:latest
+        env:
+          MINIO_ROOT_USER: clinic_storage
+          MINIO_ROOT_PASSWORD: ci-only-password
+        ports: ["9000:9000"]
+        options: >-
+          --health-cmd "curl -f http://localhost:9000/minio/health/live || exit 1"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql://clinic_app:ci-only-password@localhost:5432/clinic_management_test?schema=public
+      DATABASE_URL_PLATFORM: postgresql://clinic_platform:ci-only-password@localhost:5432/clinic_management_test?schema=public
+      REDIS_URL: redis://localhost:6379
+      STORAGE_ENDPOINT: localhost
+      STORAGE_PORT: "9000"
+      STORAGE_USE_SSL: "false"
+      STORAGE_ACCESS_KEY: clinic_storage
+      STORAGE_SECRET_KEY: ci-only-password
+      STORAGE_BUCKET_PRIVATE: clinic-documents
+      STORAGE_BUCKET_QUARANTINE: clinic-documents-quarantine
+      NODE_ENV: test
+      CORS_ORIGIN: http://localhost:3000
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate ephemeral secrets for this run
+        run: |
+          {
+            echo "JWT_ACCESS_SECRET=$(openssl rand -hex 32)"
+            echo "JWT_REFRESH_SECRET=$(openssl rand -hex 32)"
+            echo "CSRF_SECRET=$(openssl rand -hex 32)"
+            echo "FIELD_ENCRYPTION_KEY=$(openssl rand -base64 32)"
+          } >> "$GITHUB_ENV"
+
+      - name: Create MinIO buckets
+        run: |
+          curl -sSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /usr/local/bin/mc
+          chmod +x /usr/local/bin/mc
+          mc alias set ci http://localhost:9000 clinic_storage ci-only-password
+          mc mb --ignore-existing ci/clinic-documents
+          mc mb --ignore-existing ci/clinic-documents-quarantine
+          mc anonymous set none ci/clinic-documents
+          mc anonymous set none ci/clinic-documents-quarantine
+
+      - name: Create database roles
+        run: PGPASSWORD=ci-only-password psql -h localhost -U clinic_app -d clinic_management_test -v ON_ERROR_STOP=1 -f packages/database/prisma/roles.sql
+
+      - name: Run migrations
+        run: pnpm --filter @clinic/database run migrate:deploy
+
+      - name: Apply row-level security policies
+        run: DATABASE_URL="$DATABASE_URL" pnpm --filter @clinic/database run rls:apply
+
+      - name: Run integration & security test suite
+        run: pnpm --filter @clinic/api run test:e2e

@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least-privilege default; jobs that need more (none currently do) declare it themselves.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PNPM_VERSION: "9.15.9"
+  NODE_VERSION: "20.18.1"
+
+jobs:
+  lint-typecheck-unit:
+    name: Lint, typecheck, unit tests
+    runs-on: ubuntu-latest
+    steps:
+      # NOTE: pinned to major version tags for readability; before relying on
+      # this in production, pin each action to a specific commit SHA instead
+      # (tags are mutable) — see docs/threat-model.md T15 (supply chain).
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @clinic/database run generate
+      - run: pnpm lint
+      - run: pnpm typecheck
+      # apps/api's `test` script is unit-only (DB-dependent specs live under
+      # test/ and are excluded) so it's safe and fast to run here; apps/web
+      # has no unit-test script (only Playwright E2E, run in the job below),
+      # and pnpm --recursive skips packages that lack the script.
+      - run: pnpm --recursive run test -- --ci
+
+  integration-e2e:
+    name: Integration + security + E2E (live stack)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: ${{ env.PNPM_VERSION }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - name: Install postgres client (for RLS/roles SQL apply)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-client
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @clinic/database run generate
+
+      - name: Start ephemeral service stack
+        run: docker compose -f docker-compose.test.yml up -d --wait
+
+      - name: Prepare .env for test stack
+        run: |
+          cat > .env <<'EOF'
+          DATABASE_URL=postgresql://clinic_app:test-only-password@localhost:5432/clinic_management_test?schema=public
+          DATABASE_URL_PLATFORM=postgresql://clinic_platform:test-only-password@localhost:5432/clinic_management_test?schema=public
+          REDIS_URL=redis://localhost:6379
+          STORAGE_ENDPOINT=localhost
+          STORAGE_PORT=9000
+          STORAGE_USE_SSL=false
+          STORAGE_ACCESS_KEY=clinic_storage
+          STORAGE_SECRET_KEY=test-only-password
+          STORAGE_BUCKET_PRIVATE=clinic-documents
+          STORAGE_BUCKET_QUARANTINE=clinic-documents-quarantine
+          STORAGE_SIGNED_URL_TTL_SECONDS=300
+          JWT_ACCESS_SECRET=ci-test-access-secret-not-for-production-use
+          JWT_REFRESH_SECRET=ci-test-refresh-secret-not-for-production-use
+          JWT_ACCESS_TTL=15m
+          JWT_REFRESH_TTL=7d
+          COOKIE_DOMAIN=localhost
+          CSRF_SECRET=ci-test-csrf-secret-not-for-production-use
+          FIELD_ENCRYPTION_KEY=MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=
+          NODE_ENV=test
+          API_PORT=4000
+          WEB_PORT=3000
+          API_URL=http://localhost:4000
+          WEB_URL=http://localhost:3000
+          CORS_ORIGIN=http://localhost:3000
+          SMTP_HOST=localhost
+          SMTP_PORT=1025
+          SMTP_FROM="Clinic Platform <no-reply@clinic.local>"
+          RATE_LIMIT_LOGIN_MAX=5
+          RATE_LIMIT_LOGIN_WINDOW_SECONDS=60
+          EOF
+
+      - name: Apply migrations and RLS/role policies
+        run: |
+          set -a; source .env; set +a
+          pnpm --filter @clinic/database run migrate:deploy
+          pnpm --filter @clinic/database run roles:apply
+          pnpm --filter @clinic/database run rls:apply
+
+      - name: API unit + integration tests (includes tenant isolation / IDOR suite)
+        run: pnpm --filter api run test:integration
+
+      - name: API security test suite
+        run: pnpm --filter api run test:security
+
+      - name: Build apps
+        run: pnpm build
+
+      - name: Install Playwright browsers
+        run: pnpm --filter web exec playwright install --with-deps chromium
+
+      - name: Playwright E2E smoke
+        run: pnpm test:e2e
+
+      - name: Tear down stack
+        if: always()
+        run: docker compose -f docker-compose.test.yml down -v
